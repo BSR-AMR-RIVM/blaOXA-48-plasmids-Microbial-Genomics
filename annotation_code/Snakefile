@@ -1,0 +1,138 @@
+#--------------------------------------------------------------------------------
+# Name     :	Annotation pipeline
+#
+# Purpose  :	Final version of the plasmid pipeline:
+#                - able to annotate files in bulk
+#                - able to use custom databases to expand annotation
+#                - able to apply small changes for import in BioNumerics
+#				 - able to align the files in bulk
+#				 - able to supplement the original annotation with BLAST data
+#
+# Author   :    Dyogo Borst, RIVM
+#
+# Date     :    02/07/2019
+#
+#--------------------------------------------------------------------------------
+
+# this pipeline uses a config file to navigate trough input files.
+# ! files for annotation should be put in the 'input' folder, before running 'scripts/makeConfig.py > config/config.yaml', to ensure annotation on the latest files.
+configfile: "config/config.yaml"
+
+rule all:
+	input:
+		expand("output/annotation/{run}.gbk", run=config["run"])
+
+# this rule uses the annotation tool Prokka (Seemann T. Prokka: rapid prokaryotic genome annotation, Bioinformatics 2014 Jul 15;30(14):2068-9. PMID:24642063)
+# the reference databases made in create_reference are first used for annotation, before Prokka uses their own generic databases.
+rule run_prokka:
+	input:
+		lambda wildcards: config["run"][wildcards.run]
+	output:
+		"output/prokka/base/{run}/{run}.gbk" 
+	params:
+		prefix="{run}",
+		output="output/prokka/base/{run}"
+	benchmark:
+		"output/benchmarks/{run}/prokka.benchmark.txt"
+	shell:
+		"prokka {input} --outdir {params.output} --prefix {params.prefix} --proteins genbank/ResPlas_Reference_Genes.gb --force --coverage 98"
+
+# this rule utilizes the script bionumerics_gbkPrep.py to modify the genbank (.gbk) output files before they can be imported into BioNumerics.
+# the Python script uses the information given in the filename to complete the genbank entry.
+rule BN_prep:
+	input:
+		"output/prokka/base/{run}/{run}.gbk"
+	output:
+		"output/prokka/prepped/{run}.gbk"
+	shell:
+		"python scripts/bionumerics_gbkPrep.py {input} > {output}"
+
+# this rule utilizes the script adjustNames.py to modify the gene names in the .gbk files after annotation with prokka (formerly restoreGenes.py).
+# the Python script removes all numeric values and underscores at the end of a gene name, but supplements hypothetical proteins with underscores and a numeric value.
+# at line 15 of the python script a elif was added to remove lines containing (/product=)"_no_value" until there is a better solution.
+rule adjust_names:
+	input:
+		"output/prokka/prepped/{run}.gbk"
+	output:
+		"output/prokka/adjusted/{run}.gbk"
+	shell:
+		"python scripts/adjustNames.py {input} > {output}"
+
+# this rule uses a short command to remove all lines containing the case sensitive 'Unclassified', this because Prokka lacks organism specification when handling resistance genes.
+rule rm_unclassified:
+	input:
+		"output/prokka/adjusted/{run}.gbk"
+	output:
+		"output/prokka/final/{run}.gbk"
+	shell:
+		"sed '/Unclassified./d' ./{input} > {output}"
+
+# this rule utilizes the script dict2fasta.py to use biopython in order to create a dictionary of all the entries within the .gbk file. 
+# the script was first created to index all the .gbk entries in order for a quick 
+rule create_dict:
+	input:
+		"output/prokka/final/{run}.gbk"
+	output:
+		"output/dict2fasta/dictionary/{run}.txt"
+	shell:
+		"python scripts/createDict.py {input} > {output}"
+
+# this rule utilizes the script filterHypothetical.py which filters all the lines containing hypothetical proteins.
+rule filter_hypothetical:
+	input:
+		"output/dict2fasta/dictionary/{run}.txt"
+	output:
+		"output/dict2fasta/filtered/{run}.txt"
+	shell:
+		"python scripts/filterHypothetical.py {input} > {output}"
+
+# this rule utilizes the script dictSplit_v2.py which extracts all the hypothetical proteins as headers and their protein sequences as a fasta formatted sequence.
+rule split_dictionary:
+	input:
+		"output/dict2fasta/filtered/{run}.txt"
+	output:
+		"output/dict2fasta/fasta/{run}.fasta"
+	shell:
+		"python scripts/dictSplit_v2.py {input} > {output}"
+
+# uses blastr to align the protein sequences of the input files to the nr database from NCBI.
+rule run_blast:
+	input:
+		"output/dict2fasta/fasta/{run}.fasta"
+	output:
+		"output/blast/base_output/{run}.txt"
+	benchmark:
+		"output/benchmarks/{run}/blast.benchmark.txt"
+	shell:
+		"blastp -db db/nr/nr -query {input} -max_target_seqs 1 -max_hsps 1 -outfmt '6 qseqid stitle length qlen slen qstart qend sstart send pident mismatch gapopen sseqid' -out {output}"
+
+# this rule utilizes the script filterAlignments.py to filter the files based on identity percentage 
+rule filter_alignments:
+	input:
+		"output/blast/base_output/{run}.txt"
+	output:
+		"output/blast/filtered_alignments/{run}.txt"
+	shell:
+		"python scripts/filterAlignments.py {input} > {output}"
+
+# this rule utilizes the script blast2gbk.py to supplement the original annotation .gbk file wilt the blast hits from the hypothetical proteins
+rule replace_hypothetical:
+	input:
+		"output/blast/filtered_alignments/{run}.txt",
+		"output/prokka/final/{run}.gbk"
+	output:
+		"output/blast/replaced_hits/{run}.gbk"
+	shell:
+		"python scripts/blast2gbk.py {input} > {output}"
+
+# this rule utilizes the script restoreHypothetical.py to remove the underscores and numeric values of the remaining hypothetical proteins
+# this is the final rule in the pipeline and is noted in rule all.
+rule restore_hypothetical:
+	input:
+		"output/blast/replaced_hits/{run}.gbk"
+	output:
+		"output/annotation/{run}.gbk"
+	shell:
+		"python scripts/restoreHypothetical.py {input} > {output}"
+
+
